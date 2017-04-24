@@ -2,51 +2,35 @@ import autograd.numpy as np
 from autograd import grad, elementwise_grad
 
 from scipy.special import gammaincinv, gamma
+from parameters import Parameter, ParameterSet
 
-class Source(object):
-
-    # this is not the right wat to deal with parameters.
-    n = 4.0
-    x0 = 0.
-    y0 = 0.
-    theta = np.deg2rad(30)
-    a = 2.
-    b = 1.
+class Source(ParameterSet):
 
 
     def __init__(self, nx=10, ny=10, **kwargs):
+        self._paramlist = []
+        for k, (init, free) in kwargs.items():
+            p = Parameter(k, initial=init, free=free)
+            self._paramlist.append(p)
+
         self.points = self.draw_samples(nx, ny)
-        self.update(**kwargs)
 
-    def update(self, **kwargs):
-        for k, v  in kwargs.items():
-            self.__dict__[k] = v  # HAAAACK        
-
-    def update_vec(self, vec):  # super hacky
-        self.a = vec[0]
-        self.b = vec[1]
-        self.theta = vec[2]
-        self.x0 = vec[3]
-        self.y0 = vec[4]
-
-        
-    @property
-    def params(self):
-        return np.array([self.a, self.b, self.theta, self.x0, self.y0])
 
     def coordinates(self, params):
         """Return the detector coordinates of the source given params
         """
-        rot = rotation_matrix(params[2])
+        self.value = params
+        rot = rotation_matrix(self.params['theta'].value[0])
         #scale = np.array([[params[0], 0],
         #                  [0, params[1]]])
-        scale = scale_matrix(params[0], params[1])
-    
-        rp = np.dot(rot, np.dot(scale, self.points)) + params[-2:, None]
+        scale = scale_matrix(self.params['a'].value[0], self.params['b'].value[0])
+
+        mu = np.array([self.params['x0'].value[0], self.params['y0'].value[0]])
+        rp = np.dot(rot, np.dot(scale, self.points)) + mu[:, None]
         return rp
 
     def draw_samples(self, nx, ny):
-        return sample_sersic_flux(nx, ny, self.n)
+        return sample_sersic_flux(nx, ny, self.params['n'].value[0])
 
     def weights(self, x, y):
         """Optionally reweight the samples
@@ -87,8 +71,8 @@ class PixelResponse(object):
         source.
         """
         self.source = source
-        c = self.counts(self.source.params)
-        g = self.counts_gradient(self.source.params)
+        c = self.counts(self.source.value)
+        g = self.counts_gradient(self.source.value)
         return c, g
 
     def counts(self, params):
@@ -100,11 +84,11 @@ class PixelResponse(object):
         return c
 
     @property
-    def _counts_gradient(self):
+    def _counts_gradient_fn(self):
         return grad(self.counts)
 
     def counts_gradient(self, params):
-        return self._counts_gradient(params)    
+        return self._counts_gradient_fn(params)    
 
 
 class ImageModel(object):
@@ -116,33 +100,34 @@ class ImageModel(object):
         self.image = np.zeros(self.npix)
         for i, p in enumerate(self.pixels):
             p.source = source
-            self.image[i] = p.counts(source.params)
+            self.image[i] = p.counts(source.value)
 
         return self.image
 
     def counts_and_gradients(self, source):
-        self.image = np.zeros([len(source.params) + 1, self.npix])
-        for i, p in enumerate(self.pixels):
+        image = np.zeros([len(source.value) + 1, self.npix])
+        for i, p in enumerate(self.pixels):  # YUUUUUCKKK!
             v, g = p.counts_and_gradients(source)
-            self.image[0, i] = v
-            self.image[1:,i] = g
-        return self.image
+            image[0, i] = v
+            image[1:,i] = g
+        return image
 
     @property
     def npix(self):
         return len(self.pixels)    
-        
-class Likelihood(object):
 
-    def __init__(self, Pixels, Source, data, unc):
-        self.model = Pixels
+
+class Likelihood(ImageModel):
+
+    def __init__(self, pixel_list, Source, data, unc):
+        self.pixels = pixel_list
         self.source = Source
         self.data = data
         self.unc = unc
 
     def lnlike(self, params):
-        self.source.update_vec(params)
-        image = self.model.counts_and_gradients(self.source)
+        self.source.value = params
+        image = self.counts_and_gradients(self.source)
         delta = self.data - image[0, :]
         chi = delta / self.unc
         lnlike = -0.5 * np.sum(chi**2)
@@ -226,43 +211,31 @@ if __name__ == "__main__":
     x0 = 0.5
     y0 = -0.5
     ptrue = np.array([a, b, theta, x0, y0])
-    
-    lnp = countrate(ptrue)
-    counts_grad = grad(countrate)
-    
-    print(counts_grad(ptrue))
-
-    galaxy = Source(a=a, b=b, theta=theta, x0=x0, y0=y0)
-    #lnp = galaxy.counts(params)
-    #cg = grad(obj.counts)
-    #print(cg(params))
-    #print(galaxy.counts_gradient(params))
-
-    pixel = PixelResponse(mu=[0., 0.])
-    pixel.source = galaxy
-    lnp = pixel.counts(ptrue)
-    print(pixel.counts_and_gradients(galaxy)[1])
 
 
     # --- Set up the galaxy and pixels -----
-    galaxy = Source(a=a, b=b, theta=theta, x0=x0, y0=y0, nx=50, ny=70, n=1.0)
-    nx = ny = 40
-    pixel_list = [PixelResponse(mu=[i, j]) for i in range(-nx/2, nx/2) for j in range(-ny/2, ny/2)]
-    pixels = ImageModel(pixel_list)
+    galaxy = Source(a=(a, True), b=(b, True), theta=(theta, True),
+                    x0=(x0, True), y0=(y0, True), n=(1.0, False),
+                    nx=50, ny=70)
+    npx = npy = 40
+    pixel_list = [PixelResponse(mu=[i, j])
+                  for i in range(-npx/2, npx/2)
+                  for j in range(-npy/2, npy/2)]
+    imod = ImageModel(pixel_list)
 
     import sys
-    #sys.exit()
 
     # ---- Fake image -----
-    image = pixels.counts(galaxy)
+    image = imod.counts(galaxy)
     unc = np.sqrt(image)
-    coo_true = galaxy.coordinates(galaxy.params)
+    coo_true = galaxy.coordinates(galaxy.value)
 
     # ---- Likelihood object and negative ln-likelihood for minimization
-    model = Likelihood(pixels, galaxy, image, unc)
+    model = Likelihood(pixel_list, galaxy, image, unc)
     def nll(params):
         v, g = model.lnlike(params)
         return -v, -g
+    sys.exit()
 
     # --- Initial parameter value -----
     p0 = np.array([11.0, 5.1, 0.3, 0.3, -0.3])
@@ -277,7 +250,7 @@ if __name__ == "__main__":
 
     # Plot image gradients
 
-    def plot_gradients(parvec, galaxy, pixels):
+    def plot_gradients(parvec, galaxy=galaxy, pixels=model):
         galaxy.update_vec(parvec)
         imgr = pixels.counts_and_gradients(galaxy)
 
